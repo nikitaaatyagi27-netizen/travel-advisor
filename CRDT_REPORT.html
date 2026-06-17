@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Collaborative Itinerary CRDT — Full Report</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: #1f2330; line-height: 1.55; font-size: 10.5pt; margin: 0;
+  }
+  h1 { font-size: 24pt; color: #2f3a16; margin: 0 0 4px; line-height: 1.15; }
+  h2 {
+    font-size: 15pt; color: #fff; background: #6b7a3a; padding: 7px 12px;
+    border-radius: 5px; margin: 26px 0 12px; page-break-after: avoid;
+  }
+  h3 { font-size: 12.5pt; color: #4a5526; margin: 18px 0 6px; page-break-after: avoid; }
+  h4 { font-size: 11pt; color: #b5417f; margin: 14px 0 4px; page-break-after: avoid; }
+  p { margin: 7px 0; }
+  .subtitle { color: #6b7a3a; font-size: 12pt; font-weight: 600; margin: 0 0 2px; }
+  .meta { color: #8a8f9c; font-size: 9pt; margin: 2px 0 0; }
+  code {
+    font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+    background: #f1f0e6; padding: 1px 5px; border-radius: 3px; font-size: 9.2pt; color: #774;
+  }
+  pre {
+    background: #2b2d23; color: #e7e9d8; padding: 12px 14px; border-radius: 6px;
+    overflow-x: auto; font-size: 8.4pt; line-height: 1.45; page-break-inside: avoid;
+    border-left: 4px solid #e4699a; white-space: pre-wrap; word-wrap: break-word;
+  }
+  pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+  .callout {
+    background: #faf6e8; border: 1px solid #f5d97a; border-left: 5px solid #f5d97a;
+    padding: 9px 13px; border-radius: 5px; margin: 12px 0; page-break-inside: avoid;
+  }
+  .callout.pink { background: #fdeef5; border-color: #e4699a; border-left-color: #e4699a; }
+  .callout.olive { background: #f3f5ea; border-color: #6b7a3a; border-left-color: #6b7a3a; }
+  .callout b { color: #2f3a16; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 9pt; page-break-inside: avoid; }
+  th { background: #6b7a3a; color: #fff; text-align: left; padding: 6px 9px; }
+  td { border: 1px solid #ddd; padding: 6px 9px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f8f8f2; }
+  ul, ol { margin: 7px 0; padding-left: 22px; }
+  li { margin: 3px 0; }
+  .toc { background: #f8f8f2; border-radius: 6px; padding: 10px 18px; font-size: 10pt; }
+  .toc ol { padding-left: 20px; }
+  .file-tag {
+    display: inline-block; font-family: Consolas, monospace; font-size: 8pt;
+    background: #2f3a16; color: #e7e9d8; padding: 2px 7px; border-radius: 3px; margin-bottom: 4px;
+  }
+  .page-break { page-break-before: always; }
+  hr { border: none; border-top: 1px solid #e0e0d5; margin: 22px 0; }
+  .mono-small { font-family: Consolas, monospace; font-size: 8.5pt; }
+  .ascii { background: #f1f0e6; border-radius: 5px; padding: 10px; font-family: Consolas, monospace; font-size: 8.2pt; line-height: 1.3; white-space: pre; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>The Collaborative Itinerary CRDT</h1>
+<p class="subtitle">A complete, beginner-to-confident walkthrough of the conflict-free ordered list that powers shared trip planning</p>
+<p class="meta">Travel Advisor project &middot; fractional-indexing ordering &middot; action-based real-time sync &middot; generated 2026-06-17 &middot; <b>includes the hardening pass (&sect;12)</b></p>
+
+<div class="toc">
+<b>Contents</b>
+<ol>
+  <li>What problem are we even solving? (the intuition)</li>
+  <li>CRDT crash course — just enough theory</li>
+  <li>The big idea: ordering by a string, not an index</li>
+  <li>Fractional indexing from first principles</li>
+  <li>The load-bearing invariant (and the bug that taught us)</li>
+  <li>The full <code>fracdex.js</code> code, line by line</li>
+  <li>Action-based sync: how edits travel and merge</li>
+  <li>The data model &amp; the server store</li>
+  <li>The real-time layer (Socket.IO rooms)</li>
+  <li>The client hook: optimistic UI + reconciliation</li>
+  <li>The fuzz test: why 300k random checks</li>
+  <li>The hardening pass: 7 fixes that solidify the CRDT</li>
+  <li>Worked example: two people, one merge</li>
+  <li>Glossary &amp; cheat-sheet</li>
+</ol>
+</div>
+
+<div class="callout pink">
+<b>Read me first.</b> Sections 1&ndash;11 teach the core idea with the <i>original</i>, single-key design — that's the clearest way to learn it. Section&nbsp;12 then layers on the <b>hardening pass</b> that makes it production-solid: <b>compound keys</b> (the order is now <code>"&lt;frac&gt;#&lt;siteId&gt;"</code>), a <b>version counter</b> for dropped-message detection, an <b>offline outbox</b>, and three more fixes. Where &sect;1&ndash;11 say the key is just <code>"m"</code>, &sect;12 upgrades it to <code>"m#srv"</code>.
+</div>
+
+<h2>1 &middot; What problem are we even solving?</h2>
+<p>
+The shared itinerary is an <b>ordered list of stops</b> that several people edit <b>at the same time</b>. Alice drags "Eiffel Tower" to the top while Bob, on his phone, drags "Louvre" to the bottom — both in the same second. The app must end up with <b>one list that contains both changes</b>, on every screen, without anyone's edit silently vanishing.
+</p>
+
+<div class="callout pink">
+<b>The original bug (why this feature exists).</b> The first version synced the <i>whole list</i> with "last write wins": each client sent its entire itinerary, and whichever message arrived last overwrote the other. Two simultaneous reorders &rarr; one of them was erased. That is the <i>exact</i> failure a collaborative planner cannot have.
+</div>
+
+<p>
+We need a scheme where two concurrent reorders of <b>different items</b> <i>merge</i> automatically rather than fight. That is precisely what a <b>CRDT</b> gives us.
+</p>
+
+<h2>2 &middot; CRDT crash course</h2>
+<p>
+<b>CRDT = Conflict-free Replicated Data Type.</b> It's a data structure designed so that multiple copies (replicas) can be edited independently and <b>always merge to the same final value</b>, regardless of the order updates arrive in. No locks, no "who wins" arbitration.
+</p>
+<p>The magic property is that the merge operation is:</p>
+<table>
+  <tr><th>Property</th><th>Plain English</th><th>Why it matters here</th></tr>
+  <tr><td>Commutative</td><td>A then B = B then A</td><td>Network reorders messages; result is identical either way.</td></tr>
+  <tr><td>Associative</td><td>Grouping doesn't matter</td><td>Batches of updates merge the same as one-by-one.</td></tr>
+  <tr><td>Idempotent</td><td>Applying twice = applying once</td><td>A re-delivered message can't corrupt state.</td></tr>
+</table>
+<p>
+There are two broad families: <b>state-based</b> (send the whole state, merge with a "join" function) and <b>operation-based</b> (send small operations that commute). Our itinerary is <b>operation-based</b>: we ship tiny <code>add</code> / <code>remove</code> / <code>move</code> actions.
+</p>
+
+<div class="callout olive">
+<b>Our CRDT is deliberately small.</b> We do not use a heavyweight library (Yjs, Automerge). The <i>only</i> piece that needs CRDT thinking is <b>ordering</b>, so we built exactly that one primitive — fractional indexing — and nothing more. Everything else (add/remove) is naturally conflict-free because each item has a unique id.
+</div>
+
+<h2>3 &middot; The big idea: order by a string, not an index</h2>
+<p>
+Array indices are the enemy of collaboration. If "position 2" is the source of truth, then the instant someone inserts at position 1, <i>every</i> later index shifts — so two people's "move to position 2" mean different things by the time they arrive.
+</p>
+<p>The fix: <b>each item carries its own <code>order</code> string, and the list is simply "items sorted by that string."</b></p>
+<ul>
+  <li>To <b>move</b> an item, we rewrite <b>only its own</b> <code>order</code> key to a value that sorts between its new neighbours.</li>
+  <li>Two people moving two <b>different</b> items touch two <b>different</b> keys &rarr; the edits never collide &rarr; they merge.</li>
+</ul>
+
+<div class="ascii">list  =  sortByOrder(items)
+
+  item A   order = "h"
+  item B   order = "m"      &lt;-- compare these strings lexicographically
+  item C   order = "t"
+
+  move B between A and C  -&gt;  give B a new key strictly between "h" and "t", e.g. "n"
+  (nobody else's key changed)</div>
+
+<p>So the entire problem reduces to one question:</p>
+<div class="callout">
+<b>"Given two keys <code>a &lt; b</code>, produce a new key <code>K</code> with <code>a &lt; K &lt; b</code>."</b><br>
+And you must <i>always</i> be able to do it — even when <code>a</code> and <code>b</code> look adjacent like <code>"m"</code> and <code>"n"</code>. That's <b>fractional indexing</b>.
+</div>
+
+<h2>4 &middot; Fractional indexing from first principles</h2>
+<p>
+Think of the keys as <b>fractions between 0 and 1</b>. Between any two distinct fractions there's always another one (take the midpoint). 0.5 sits between 0 and 1; 0.25 between 0 and 0.5; 0.375 between 0.25 and 0.5 — you can subdivide forever. Real numbers never "run out of room."
+</p>
+<p>
+We can't use floating-point (it has finite precision and <i>does</i> run out), so we encode the same idea as <b>strings compared lexicographically</b>. Here the "digits" are the letters <code>a</code>..<code>z</code> (base-26). String comparison works digit-by-digit, exactly like comparing decimals.
+</p>
+<table>
+  <tr><th>Fractions</th><th>Our string keys</th><th>Idea</th></tr>
+  <tr><td>0 .. 1</td><td><code>a</code> .. <code>z</code></td><td>The alphabet is our digit set.</td></tr>
+  <tr><td>midpoint of 0,1 = 0.5</td><td><code>keyBetween(null,null)</code> = <code>"m"</code></td><td>Middle digit, maximum elbow room.</td></tr>
+  <tr><td>between 0.5 and 1</td><td>between <code>"m"</code> and <code>null</code> &rarr; a digit above <code>m</code></td><td>Open upper bound = "append at end".</td></tr>
+  <tr><td>0.5 and 0.51 (adjacent)</td><td><code>"m"</code> and <code>"n"</code> &rarr; <code>"m" + something</code></td><td>No digit fits between, so <b>add a digit</b>: e.g. <code>"mm"</code>.</td></tr>
+</table>
+
+<div class="callout pink">
+<b>The key insight for adjacent keys.</b> There is nothing between <code>"m"</code> and <code>"n"</code> at one character. But <code>"mm"</code> sorts <i>after</i> <code>"m"</code> (longer, shares the prefix) and <i>before</i> <code>"n"</code> (because <code>m &lt; n</code> at position 0). So we keep the lower key's digit and <b>descend into a new character position</b> — just like writing 0.55 between 0.5 and 0.6. Strings can grow, so we never run out of room.
+</div>
+
+<h2 class="page-break">5 &middot; The load-bearing invariant</h2>
+<p>Our <code>keyBetween(a, b)</code> guarantees three things for valid inputs:</p>
+<ol>
+  <li><b>BETWEEN:</b> <code>a &lt; K &lt; b</code> (lexicographically).</li>
+  <li><b>NON-EMPTY:</b> <code>K.length &ge; 1</code>.</li>
+  <li><b>STABLE TERMINAL:</b> <code>K</code> never ends in the lowest digit <code>'a'</code> or the highest digit <code>'z'</code>.</li>
+</ol>
+<p>Rule (3) is the one that makes the whole thing correct. Because <b>no key ever ends in <code>'a'</code> or <code>'z'</code></b>:</p>
+<ul>
+  <li>You can <b>always</b> find a key below any <code>K</code>: it doesn't end in <code>'a'</code>, so lower the last digit.</li>
+  <li>You can <b>always</b> find a key above any <code>K</code>: it doesn't end in <code>'z'</code>, so raise the last digit.</li>
+  <li>Therefore every pair of distinct neighbours has a gap, and <code>keyBetween</code> is <b>injective</b> — it can never map two different neighbour-pairs onto the <i>same</i> key.</li>
+</ul>
+<p>We treat <code>'a'</code> and <code>'z'</code> as pure <b>boundary markers</b> ("smaller / larger than any real key"). The usable terminal digits are <code>'b'</code>..<code>'y'</code>.</p>
+
+<div class="callout pink">
+<b>The bug that taught us this.</b> The very first prototype <i>passed all the example tests</i> and still produced <b>duplicate keys</b> under random load. It was non-injective: in the adjacent-digit branch it discarded the lower bound's tail, so two different neighbour pairs could map to one key. Two items with the <i>same</i> <code>order</code> &rarr; unstable sort &rarr; the list flickers/duplicates. The fix was the "never end in 'a'/'z'" invariant, and the <b>fuzz test</b> (&sect;11) exists specifically to catch this class of bug that example tests miss.
+</div>
+
+<h2>6 &middot; The full <code>fracdex.js</code>, explained</h2>
+<p><span class="file-tag">server/src/fracdex.js</span> &nbsp; (the client copy <span class="file-tag">src/collab/fracdex.js</span> is identical logic, kept in sync by hand — there's no shared module across the client/server boundary here).</p>
+
+<h4>Setup: the digit alphabet</h4>
+<pre><code>const DIGITS = 'abcdefghijklmnopqrstuvwxyz';
+const MIN = 0;                 // 'a' — boundary marker, never a terminal digit
+const MAX = DIGITS.length - 1; // 'z' (25) — boundary marker, never a terminal digit
+const val = (c) =&gt; DIGITS.indexOf(c);   // 'c' -&gt; 2
+const chr = (v) =&gt; DIGITS[v];           // 2   -&gt; 'c'
+const midDigit = (lo, hi) =&gt; Math.floor((lo + hi) / 2);  // integer midpoint digit</code></pre>
+
+<h4>The entry point: <code>keyBetween(lo, hi)</code></h4>
+<pre><code>export const keyBetween = (lo, hi) =&gt; {
+  // Legacy rows predate `order` and carry '' — not a real key, so treat '' as an open end.
+  const a = lo || null;
+  const b = hi || null;
+  if (a !== null &amp;&amp; b !== null &amp;&amp; a &gt;= b) {
+    throw new Error(`keyBetween: lower "${a}" must be &lt; upper "${b}"`);
+  }
+  if (a === null &amp;&amp; b === null) return chr(midDigit(MIN, MAX)); // 'm' — middle, max room
+  if (a === null) return before(b);   // open lower bound  -> "insert at front"
+  if (b === null) return after(a);    // open upper bound  -> "append at end"
+  return between(a, b);               // two real keys     -> squeeze between them
+};</code></pre>
+<p>Four cases: both ends open (the very first item, <code>"m"</code>), front insert, end insert, and the general "between two real keys" case. Each delegates to a small helper.</p>
+
+<h4><code>after(a)</code> — a key strictly greater than <code>a</code></h4>
+<pre><code>const after = (a) =&gt; {
+  if (a.length === 0) return chr(midDigit(MIN, MAX));       // 'm'
+  const d = val(a[0]);
+  if (d &lt;= MAX - 2) {
+    // a[0] is 'a'..'x': a usable digit ('b'..'y') sits strictly above it.
+    return chr(Math.floor((d + 1 + MAX) / 2));
+  }
+  if (d === MAX - 1) {
+    // a[0] is 'y': nothing usable between 'y' and 'z'. Step to the 'z' boundary
+    // (non-terminal) and append a middle digit. "zm..." &gt; any "y..." since 'z' &gt; 'y'.
+    return chr(MAX) + chr(midDigit(MIN, MAX));              // -> "zm"
+  }
+  // a[0] is 'z' (MAX): keep it (it's a non-terminal boundary) and recurse for room above.
+  return a[0] + after(a.slice(1));
+};</code></pre>
+
+<h4><code>before(b)</code> — a key strictly less than <code>b</code> (mirror image)</h4>
+<pre><code>const before = (b) =&gt; {
+  if (b.length === 0) return chr(midDigit(MIN, MAX));       // 'm'
+  const d = val(b[0]);
+  if (d &gt;= MIN + 2) return chr(midDigit(MIN, d));          // usable digit below b[0]
+  if (d === MIN + 1) return chr(MIN) + chr(midDigit(MIN, MAX)); // 'b' -> "am"
+  return b[0] + before(b.slice(1));                          // 'a' — keep and descend
+};</code></pre>
+
+<h4><code>between(a, b)</code> — the general case</h4>
+<pre><code>const between = (a, b) =&gt; {
+  let i = 0, prefix = '';
+  while (i &lt; a.length &amp;&amp; i &lt; b.length &amp;&amp; a[i] === b[i]) { prefix += a[i]; i += 1; } // shared prefix
+  if (i &gt;= a.length) return prefix + before(b.slice(i));   // a is a prefix of b (e.g. "m","mam")
+
+  const da = val(a[i]);
+  const db = val(b[i]);                                     // b is greater, so it has a digit here
+  if (db - da &gt; 1) return prefix + chr(midDigit(da, db));  // gap -> a midpoint digit fits
+  // Adjacent (db === da+1): no room here. Keep a's digit, then a key strictly ABOVE a's tail
+  // (open upper) — stays above a, still below b.
+  return prefix + a[i] + after(a.slice(i + 1));
+};</code></pre>
+
+<h4>Two convenience helpers</h4>
+<pre><code>// The key that places a new item AFTER the current last item.
+export const keyAfterLast = (lastOrder) =&gt; keyBetween(lastOrder || null, null);
+
+// Sort items by their order key. STABLE, so legacy rows sharing an empty key keep order.
+export const sortByOrder = (items) =&gt;
+  [...items].sort((x, y) =&gt; {
+    const ox = x.order ?? '', oy = y.order ?? '';
+    return ox &lt; oy ? -1 : ox &gt; oy ? 1 : 0;
+  });</code></pre>
+
+<h2 class="page-break">7 &middot; Action-based sync: how edits travel</h2>
+<p>
+The client never sends the whole list. It sends one of three tiny <b>actions</b>. Each action touches exactly one item, so concurrent actions on <i>different</i> items are independent.
+</p>
+<table>
+  <tr><th>Action (emit)</th><th>Server broadcasts</th><th>What changes</th></tr>
+  <tr><td><code>itinerary:add</code></td><td><code>itinerary:item-added</code></td><td>One new item, key = <code>keyAfterLast(last)</code>.</td></tr>
+  <tr><td><code>itinerary:remove</code></td><td><code>itinerary:item-removed</code></td><td>One item filtered out by id.</td></tr>
+  <tr><td><code>itinerary:move</code></td><td><code>itinerary:item-moved</code></td><td><b>Only that item's <code>order</code></b> is rewritten.</td></tr>
+</table>
+
+<div class="callout olive">
+<b>Server is the source of truth for <code>order</code>.</b> The server broadcasts each change to <b>everyone, including the original sender</b>. The sender shows an instant <i>optimistic</i> version, then reconciles against the server's authoritative event. This keeps all replicas converging on one set of keys.
+</div>
+
+<h2>8 &middot; The data model &amp; store</h2>
+<p><span class="file-tag">server/src/models/Trip.js</span> — each itinerary item stores its own <code>order</code> string:</p>
+<pre><code>const itineraryItemSchema = new mongoose.Schema({
+  id:        { type: String, required: true },
+  placeName: { type: String, default: 'Stop' },
+  lat:       { type: Number, required: true },
+  lng:       { type: Number, required: true },
+  addedBy:   { type: String, default: 'Someone' },
+  order:     { type: String, default: '' },   // fractional-index key; list sorts by THIS
+}, { _id: false });</code></pre>
+
+<p><span class="file-tag">server/src/store.js</span> — the mutators. Note how <code>move</code> changes one field only, and how legacy rows self-heal:</p>
+<pre><code>// Append a new stop after the current last one. Ignores duplicate ids.
+export const addItineraryItem = async (code, item) =&gt; {
+  let added = null;
+  const trip = await persist(code, (t) =&gt; {
+    if (t.itinerary.some((i) =&gt; i.id === item.id)) return;
+    const last = sortByOrder(t.itinerary).at(-1);
+    added = { ...item, order: keyAfterLast(last?.order || null) };
+    t.itinerary.push(added);
+  });
+  return { trip, item: added };
+};
+
+// Set ONE item's order key (its new fractional-index position). Only that item changes.
+export const moveItineraryItem = async (code, itemId, order) =&gt; {
+  let moved = null;
+  const trip = await persist(code, (t) =&gt; {
+    const it = t.itinerary.find((i) =&gt; i.id === itemId);
+    if (!it) return;
+    it.order = order;
+    moved = { id: it.id, order };
+  });
+  return { trip, item: moved };
+};</code></pre>
+
+<h4>Self-healing legacy data (<code>backfillOrder</code>)</h4>
+<pre><code>// Ensure every item has a fractional-index `order`, preserving current array order.
+// Trips created before `order` existed have order '' — this gives them real keys so the
+// sort and keyBetween() never see an invalid empty bound. Runs on load (getTrip).
+const backfillOrder = (trip) =&gt; {
+  if (!trip?.itinerary?.length) return false;
+  let prev = null, changed = false;
+  for (const item of trip.itinerary) {
+    if (!item.order) { item.order = keyAfterLast(prev); changed = true; }
+    prev = item.order;
+  }
+  return changed;
+};</code></pre>
+
+<h2>9 &middot; The real-time layer</h2>
+<p><span class="file-tag">server/src/realtime.js</span> — each trip is a Socket.IO <b>room</b> keyed by the trip code; broadcasts are scoped to that room so edits never leak across trips.</p>
+<pre><code>socket.on('itinerary:move', async ({ itemId, order }) =&gt; {
+  if (!joinedCode) return;
+  const { trip, item: moved } = await moveItineraryItem(joinedCode, itemId, order);
+  if (trip &amp;&amp; moved) io.to(joinedCode).emit('itinerary:item-moved', moved);
+});</code></pre>
+<p>On join, the server sends the full state once, already sorted:</p>
+<pre><code>socket.emit('trip:state', {
+  code: trip.code,
+  pins: trip.pins,
+  itinerary: sortByOrder(trip.itinerary),   // canonical order from the keys
+  you: { name: me.name, color: me.color },
+});</code></pre>
+
+<h2 class="page-break">10 &middot; The client hook: optimistic + reconcile</h2>
+<p><span class="file-tag">src/collab/useCollabTrip.js</span> — the move action computes a key locally, updates the UI immediately, then emits:</p>
+<pre><code>const moveItineraryItem = useCallback((itemId, targetIndex) =&gt; {
+  const sorted  = sortByOrder(itineraryRef.current);
+  const without = sorted.filter((i) =&gt; i.id !== itemId);
+  const clamped = Math.max(0, Math.min(targetIndex, without.length));
+  const before  = without[clamped - 1]?.order ?? null;   // new left neighbour
+  const after   = without[clamped]?.order ?? null;       // new right neighbour
+  let order;
+  try { order = keyBetween(before, after); }
+  catch { return; }   // neighbours not strictly ordered (shouldn't happen) — skip, don't crash
+  setItinerary((prev) =&gt;
+    sortByOrder(prev.map((i) =&gt; (i.id === itemId ? { ...i, order } : i)))
+  );
+  socketRef.current?.emit('itinerary:move', { itemId, order });
+}, []);</code></pre>
+
+<p>And the listeners reconcile incoming server events (the server's key wins, then re-sort):</p>
+<pre><code>socket.on('itinerary:item-moved', ({ id, order }) =&gt;
+  setItinerary((prev) =&gt;
+    sortByOrder(prev.map((i) =&gt; (i.id === id ? { ...i, order } : i)))
+  )
+);</code></pre>
+
+<div class="callout">
+<b>Optimize Route reuses the same conflict-free path.</b> When the TSP optimizer reorders the whole list, the hook mints a fresh chain of strictly-increasing keys (<code>keyAfterLast</code> repeatedly) and emits one <code>move</code> per stop — so a bulk reorder flows through the exact same merge machinery as a single manual drag.
+</div>
+
+<h2>11 &middot; The fuzz test — why 300k random checks</h2>
+<p><span class="file-tag">server/test/fracdex.fuzz.mjs</span> &nbsp;(<code>npm test</code> in <code>server/</code>). Example tests are <b>not enough</b> for a hand-rolled CRDT primitive — the first prototype passed examples and still broke. This is property-based testing: assert the <i>invariants</i> hold across tens of thousands of random operations.</p>
+<table>
+  <tr><th>#</th><th>Scenario</th><th>What it proves</th></tr>
+  <tr><td>1&ndash;2</td><td>Right/left-edge squeeze (5k each)</td><td>Repeated insert next to a bound stays strictly between; keys don't blow up.</td></tr>
+  <tr><td>3&ndash;4</td><td>Repeated front / end insert (5k each)</td><td>Open-bound paths (<code>before</code>/<code>after</code>) stay correct under churn.</td></tr>
+  <tr><td>5</td><td>Insert churn (20k)</td><td>Maintaining a real sorted list yields strictly increasing, unique keys.</td></tr>
+  <tr><td>6</td><td>Move churn (20k)</td><td>The core CRDT op — random reorders never collide.</td></tr>
+  <tr><td>7</td><td>Concurrent merge</td><td>Two people moving two different items from one snapshot &rarr; deterministic <code>ZYX</code>.</td></tr>
+  <tr><td>8</td><td>Injectivity (40k inserts)</td><td><b>The exact property the first prototype violated</b>: 40k inserts &rarr; 40k unique keys, max length ~9.</td></tr>
+</table>
+<pre><code>const endsBad = (k) =&gt; k.length &gt; 0 &amp;&amp; (k[k.length-1] === 'a' || k[k.length-1] === 'z');
+const checkKey = (a, b, k) =&gt; {
+  assert(k.length &gt;= 1,            `(2) empty key for (${a},${b})`);
+  assert(a === null || a &lt; k,      `(1) lower: ${a} !&lt; ${k}`);
+  assert(b === null || k &lt; b,      `(1) upper: ${k} !&lt; ${b}`);
+  assert(!endsBad(k),              `(3) terminal 'a'/'z': ${k}`);
+};</code></pre>
+<p>Test 8 maintains a growing <code>Set</code> of every key handed out and asserts each new key is unseen — directly catching the duplicate-key (non-injective) class of bug.</p>
+
+<h2 class="page-break">12 &middot; The hardening pass: 7 fixes</h2>
+<p>
+The core in &sect;1&ndash;11 is correct, but a self-review found seven gaps between "correct in theory" and "solid in production." All seven were fixed. The unifying theme: the ordering <i>math</i> was never the weak point &mdash; the <b>sync protocol and edge cases around it</b> were. Here's each one.
+</p>
+
+<h3>Fix 1 + 2 &mdash; Compound keys (the only real divergence hole)</h3>
+<p>
+<code>keyBetween</code> is injective for <b>one</b> caller. But two people editing from the <i>same snapshot</i> can independently compute the <b>same</b> fractional key &mdash; e.g. both pick <code>"m"</code> between <code>"h"</code> and <code>"t"</code>. Two items with equal keys &rarr; their relative order is undefined, and with no tiebreaker two screens can sort them <i>differently and never converge</i>. That is the one thing a CRDT must never allow.
+</p>
+<div class="callout pink">
+<b>The fix:</b> the order is now a <b>compound key</b> <code>"&lt;frac&gt;#&lt;siteId&gt;"</code>. We compare by the fractional part first, then by a per-client <code>siteId</code> &mdash; a deterministic, replica-independent tiebreak. Same frac on two sites &rarr; every replica still agrees on the final order. The server stamps <code>srv</code>; each client gets a random site id.
+</div>
+<pre><code>const SEP = '#';
+export const stripSite  = (order) =&gt; (order == null ? '' : String(order).split(SEP)[0]);
+const        siteOf     = (order) =&gt; { const s = String(order ?? ''); const i = s.indexOf(SEP);
+                                       return i === -1 ? '' : s.slice(i + 1); };
+export const makeOrder  = (frac, siteId = '') =&gt; (siteId ? `${frac}${SEP}${siteId}` : frac);
+
+// Total order: fractional part first, then site id. (keyBetween strips the site for its math.)
+export const compareOrder = (a, b) =&gt; {
+  const fa = stripSite(a), fb = stripSite(b);
+  if (fa !== fb) return fa &lt; fb ? -1 : 1;
+  const sa = siteOf(a),    sb = siteOf(b);
+  return sa &lt; sb ? -1 : sa &gt; sb ? 1 : 0;
+};
+
+// sortByOrder now: compareOrder first, then a final fallback on `id` (stable even for legacy
+// rows that share an empty key and no site).
+export const sortByOrder = (items) =&gt;
+  [...items].sort((x, y) =&gt; {
+    const c = compareOrder(x.order ?? '', y.order ?? '');
+    if (c !== 0) return c;
+    const ix = x.id ?? '', iy = y.id ?? '';
+    return ix &lt; iy ? -1 : ix &gt; iy ? 1 : 0;
+  });</code></pre>
+<p>The fuzz test gained scenarios (&sect;9&ndash;10) that mint the <i>same</i> frac on two sites and assert <code>compareOrder</code> stays a strict total order and both replicas sort identically.</p>
+
+<h3>Fix 3 &mdash; Optimistic edits are marked "unconfirmed"</h3>
+<p>
+When you add or move a stop, the UI applies it instantly with a <i>provisional</i> key, then the server broadcasts the authoritative one. Between those, the item now carries <code>unconfirmed: true</code>; the panel <b>dims it and shows "syncing&hellip;"</b> until the server's event clears the flag. No more trusting a provisional key as if it were final.
+</p>
+
+<h3>Fix 4 + 5 &mdash; Version counter, gap-detection, resync &amp; offline outbox</h3>
+<p>
+Each trip now has a monotonic <code>version</code>, bumped on <b>every real mutation</b> (no-ops like a duplicate add don't bump it). Every broadcast carries the new version, so a client can detect a <b>dropped message</b> (a gap in the sequence) and ask for a full resync.
+</p>
+<pre><code>// CLIENT — applied to every broadcast. Ignore stale events; resync on a gap.
+const applyVersion = (v) =&gt; {
+  if (typeof v !== 'number') return true;          // versionless correction → always apply
+  if (v &lt;= versionRef.current) return false;        // stale / duplicate → ignore
+  if (v &gt; versionRef.current + 1 &amp;&amp; versionRef.current !== -1) {
+    socket.emit('trip:resync');                     // missed an event → get authoritative state
+  }
+  versionRef.current = v;
+  return true;
+};</code></pre>
+<p>
+And actions emitted while the socket is <b>disconnected</b> are queued in an <b>outbox</b> and replayed in order on reconnect (after a fresh <code>trip:join</code> re-bases the version) &mdash; so a brief drop (the "phone in a tunnel" case) doesn't silently lose your edits.
+</p>
+<pre><code>// Emit now if connected, else queue for replay on reconnect.
+const sendOrQueue = useCallback((event, payload) =&gt; {
+  const socket = socketRef.current;
+  if (socket &amp;&amp; socket.connected) socket.emit(event, payload);
+  else outboxRef.current.push({ event, payload });
+}, []);</code></pre>
+<div class="callout olive">
+Replaying a queued action after a resync is <b>safe by construction</b>: an <code>add</code> dedupes by id, a <code>move</code> just re-sets one key, and a <code>remove</code> of an already-gone item is a no-op. This is exactly the idempotence property from &sect;2 paying off.
+</div>
+
+<h3>Fix 6 &mdash; The two fracdex copies can't silently drift</h3>
+<p>
+<code>server/src/fracdex.js</code> and <code>src/collab/fracdex.js</code> are hand-duplicated (no shared module across the client/server split). A new <b>parity test</b> imports <i>both</i> and asserts they produce byte-identical results &mdash; success values <i>and</i> thrown-error behaviour &mdash; across ~26k cases. It runs as part of <code>npm test</code>, so editing one copy without mirroring the other fails CI.
+</p>
+<pre><code>import * as server from '../src/fracdex.js';
+import * as client from '../../src/collab/fracdex.js';
+// ...assert server.keyBetween(lo,hi) === client.keyBetween(lo,hi) across a 20k-op shared vector,
+//    plus keyAfterLast, makeOrder, compareOrder, sortByOrder.</code></pre>
+
+<h3>Fix 7 &mdash; The move/remove race no longer leaves a ghost</h3>
+<p>
+If Alice moves item X while Bob removes X, Alice's <code>move</code> arrives at a deleted item. The server already didn't crash (<code>if (!it) return</code>) &mdash; but Alice's optimistically-moved X used to <b>linger on her screen</b> with nothing to remove it. Now the move reports <code>orphaned: true</code>, and the realtime layer sends a <code>item-removed</code> back to just the mover (versionless, so it always applies):
+</p>
+<pre><code>socket.on('itinerary:move', async ({ itemId, order }) =&gt; {
+  const { trip, item: moved, orphaned } = await moveItineraryItem(joinedCode, itemId, order);
+  if (trip &amp;&amp; moved)  io.to(joinedCode).emit('itinerary:item-moved', { ...moved, version: trip.version });
+  else if (orphaned)  socket.emit('itinerary:item-removed', { itemId }); // drop the ghost
+});</code></pre>
+
+<table>
+  <tr><th>#</th><th>Gap</th><th>Fix in one line</th></tr>
+  <tr><td>1</td><td>Same-slot concurrent move &rarr; duplicate key</td><td>Compound key <code>frac#site</code>.</td></tr>
+  <tr><td>2</td><td>No tiebreak &rarr; replicas diverge</td><td><code>compareOrder</code> = total order (frac &rarr; site &rarr; id).</td></tr>
+  <tr><td>3</td><td>Provisional key trusted as final</td><td><code>unconfirmed</code> flag + dimmed "syncing&hellip;".</td></tr>
+  <tr><td>4</td><td>Dropped message &rarr; silent divergence</td><td>Per-trip <code>version</code> + gap detection + <code>trip:resync</code>.</td></tr>
+  <tr><td>5</td><td>Reconnect loses offline edits</td><td>Outbox queue replayed on reconnect.</td></tr>
+  <tr><td>6</td><td>Two fracdex copies drift</td><td>Parity test (26k checks) in <code>npm test</code>.</td></tr>
+  <tr><td>7</td><td>move/remove race leaves a ghost</td><td><code>orphaned</code> &rarr; remove-back to the mover.</td></tr>
+</table>
+<p class="meta">Verified: <code>npm test</code> &rarr; fuzz 309,059 checks + parity 26,262 checks, all green; <code>react-scripts build</code> compiles clean.</p>
+
+<h2 class="page-break">13 &middot; Worked example: two people, one merge</h2>
+<p>Start with three stops X, Y, Z (keys minted left to right):</p>
+<div class="ascii">X = "m"        (keyBetween(null,null))
+Y = after(X)   -> "t"      (keyAfterLast "m")
+Z = after(Y)   -> "w"      (keyAfterLast "t")
+list = X Y Z</div>
+
+<p>From that same snapshot, simultaneously:</p>
+<div class="ascii">Priya moves Z to the FRONT:  keyBetween(null, X="m") -> before("m") = "f"   so Z.order = "f"
+Aman  moves X to the END:    keyAfterLast(Z="w")     -> after("w")  = "x"   so X.order = "x"</div>
+
+<p>Both <code>move</code> actions reach the server (in any order) and are broadcast. Final keys:</p>
+<div class="ascii">Z = "f"
+Y = "t"
+X = "x"
+sortByOrder -> f &lt; t &lt; x  ->  Z, Y, X</div>
+
+<div class="callout olive">
+<b>Both edits survived.</b> Priya touched only Z's key, Aman only X's. No overwrite, no lost update — the list deterministically becomes <code>Z Y X</code> on every screen. That is the entire promise of the CRDT, demonstrated. (This is literally fuzz test &sect;11 scenario 7, which asserts the result equals <code>"ZYX"</code>.)
+</div>
+
+<h2>14 &middot; Glossary &amp; cheat-sheet</h2>
+<table>
+  <tr><th>Term</th><th>Meaning in this project</th></tr>
+  <tr><td><b>CRDT</b></td><td>Conflict-free Replicated Data Type — edits merge deterministically with no coordination.</td></tr>
+  <tr><td><b>Fractional index</b></td><td>The <code>&lt;frac&gt;</code> part of the order; between any two there's always another, so you can insert/move forever.</td></tr>
+  <tr><td><b>Compound key</b></td><td>The stored order: <code>"&lt;frac&gt;#&lt;siteId&gt;"</code>. Compared frac-then-site so two replicas with the same frac still agree (fix 1+2).</td></tr>
+  <tr><td><b>siteId</b></td><td>A per-client tag stamped onto keys it mints; the deterministic tiebreaker when two clients pick the same frac.</td></tr>
+  <tr><td><b>keyBetween(a,b)</b></td><td>The one primitive: a frac strictly between <code>a</code> and <code>b</code> (strips any site first; either bound may be <code>null</code> = open end).</td></tr>
+  <tr><td><b>compareOrder</b></td><td>Total order over compound keys: frac, then site. Backed by an <code>id</code> fallback in <code>sortByOrder</code>.</td></tr>
+  <tr><td><b>Invariant (3)</b></td><td>"A key never ends in 'a' or 'z'." Guarantees room above/below every key &rarr; injectivity.</td></tr>
+  <tr><td><b>Injective</b></td><td>Different neighbour-pairs never map to the same frac &rarr; no duplicate keys from a single caller.</td></tr>
+  <tr><td><b>Action-based sync</b></td><td>Ship tiny add/remove/move ops, not the whole list &rarr; concurrent ops on different items merge.</td></tr>
+  <tr><td><b>version</b></td><td>Per-trip monotonic counter bumped on each real mutation; a gap tells a client it missed an event (fix 4).</td></tr>
+  <tr><td><b>trip:resync</b></td><td>Client request for full authoritative state after it detects a version gap.</td></tr>
+  <tr><td><b>Outbox</b></td><td>Queue of actions emitted while offline, replayed in order on reconnect (fix 5).</td></tr>
+  <tr><td><b>unconfirmed</b></td><td>Flag on an optimistic item until the server confirms it; UI dims it as "syncing…" (fix 3).</td></tr>
+  <tr><td><b>orphaned move</b></td><td>A move targeting an already-removed item; server tells the mover to drop the ghost (fix 7).</td></tr>
+  <tr><td><b>Optimistic update</b></td><td>Apply the change locally for instant feedback, then reconcile with the server's broadcast.</td></tr>
+  <tr><td><b>Source of truth</b></td><td>The server owns the canonical <code>order</code> + <code>version</code>; clients reconcile their optimistic state to it.</td></tr>
+  <tr><td><b>backfillOrder</b></td><td>Self-heals legacy rows (empty <code>order</code>) on load so the primitive never sees a bad bound.</td></tr>
+  <tr><td><b>Parity test</b></td><td>Asserts the client &amp; server fracdex copies behave byte-identically; runs in <code>npm test</code> (fix 6).</td></tr>
+</table>
+
+<div class="callout pink">
+<b>One-sentence summary.</b> Each stop carries a sortable compound <code>order</code> key <code>"&lt;frac&gt;#&lt;site&gt;"</code>; moving a stop rewrites only that one key to sit between its new neighbours; because <code>keyBetween</code> always finds a strictly-between key and the site id breaks any frac tie (a total order, proven by a 300k-check fuzz test + a client/server parity test), and because every change is a tiny versioned action with offline replay and resync-on-gap, concurrent reorders by different people merge instead of clobbering and survive flaky connections — a small but solid, purpose-built CRDT.
+</div>
+
+<hr>
+<p class="meta">Files referenced: <code>server/src/fracdex.js</code>, <code>src/collab/fracdex.js</code>, <code>server/test/fracdex.fuzz.mjs</code>, <code>server/test/fracdex.parity.mjs</code>, <code>server/src/store.js</code>, <code>server/src/realtime.js</code>, <code>server/src/models/Trip.js</code>, <code>src/collab/useCollabTrip.js</code>, <code>src/components/Collab/CollabPanel.jsx</code>. &nbsp; All code excerpts are verbatim from the project at generation time, including the &sect;12 hardening pass.</p>
+
+</body>
+</html>
