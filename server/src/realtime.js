@@ -20,9 +20,17 @@ const COLORS = ['#e53935', '#8e24aa', '#3949ab', '#00897b', '#fb8c00', '#6d4c41'
 // roomCode -> Map(socketId -> { name, color, viewport })
 const presence = new Map();
 
+// The public presence list for a room, DEDUPED by name: one person with two tabs is two
+// sockets but should appear once in the bar. We collapse sockets that share a name, keeping
+// the color of their earliest-joined socket so a member's color stays stable as tabs open/close.
 const roomMembers = (code) => {
   const m = presence.get(code);
-  return m ? Array.from(m.values()).map(({ name, color }) => ({ name, color })) : [];
+  if (!m) return [];
+  const byName = new Map(); // name -> { name, color }
+  for (const { name, color } of m.values()) {
+    if (!byName.has(name)) byName.set(name, { name, color });
+  }
+  return Array.from(byName.values());
 };
 
 export const registerRealtime = (io) => {
@@ -43,8 +51,14 @@ export const registerRealtime = (io) => {
 
       if (!presence.has(code)) presence.set(code, new Map());
       const members = presence.get(code);
-      const color = COLORS[members.size % COLORS.length];
-      me = { name: name || 'Guest', color, viewport: null };
+      const myName = name || 'Guest';
+      // Reuse an existing color if this name is already in the room (another tab of the same
+      // person), so their tabs render consistently. Otherwise pick the next color by DISTINCT
+      // name count — multi-tab users don't burn extra color slots.
+      const existing = Array.from(members.values()).find((mem) => mem.name === myName);
+      const distinctNames = new Set(Array.from(members.values()).map((mem) => mem.name)).size;
+      const color = existing ? existing.color : COLORS[distinctNames % COLORS.length];
+      me = { name: myName, color, viewport: null };
       members.set(socket.id, me);
 
       // Send the joiner the current shared state (itinerary sorted by its order keys).

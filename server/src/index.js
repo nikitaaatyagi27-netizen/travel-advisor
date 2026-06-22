@@ -26,7 +26,16 @@ app.use('/api/memories', memoriesRouter);
 app.use('/api/distance-matrix', distanceRouter);
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: CLIENT_ORIGIN } });
+const io = new Server(server, {
+  cors: { origin: CLIENT_ORIGIN },
+  // Presence accuracy: a CLEAN tab close sends a TCP FIN and fires `disconnect` in <1s. But an
+  // UNGRACEFUL drop (laptop sleep, WiFi yanked, process killed — no FIN) is only detected when
+  // a ping goes unanswered. Defaults (pingInterval 25s / pingTimeout 20s) leave such a user a
+  // "ghost" in the presence bar for ~20s. Tightening these to 10s clears ghosts ~2x faster.
+  // (Don't go too low: an aggressive timeout can drop users on brief network blips.)
+  pingInterval: 10000,
+  pingTimeout: 10000,
+});
 registerRealtime(io);
 
 const start = async () => {
