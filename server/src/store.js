@@ -2,7 +2,9 @@ import mongoose from 'mongoose';
 import { customAlphabet } from 'nanoid';
 import { Trip } from './models/Trip.js';
 import { Memory } from './models/Memory.js';
-import { keyAfterLast, sortByOrder, makeOrder, stripSite } from './fracdex.js';
+import {
+  keyAfterLast, sortByOrder, makeOrder, stripSite, needsRebalance, rebalanceOrders,
+} from './fracdex.js';
 
 // Site id stamped onto every order key the SERVER mints (adds/backfills). The server is the
 // ordering authority, so a single stable site id is enough to tiebreak its keys against any
@@ -169,15 +171,29 @@ export const removeItineraryItem = (code, itemId) =>
 export const moveItineraryItem = async (code, itemId, order) => {
   let moved = null;
   let orphaned = false;
+  let needsRebal = false;
   const trip = await persist(code, (t) => {
     const it = t.itinerary.find((i) => i.id === itemId);
     if (!it) { orphaned = true; return false; } // raced with a remove
     it.order = order;
     moved = { id: it.id, order };
+    needsRebal = needsRebalance(t.itinerary); // a key may have grown past the threshold
     return true;
   });
-  return { trip, item: moved, orphaned };
+  return { trip, item: moved, orphaned, needsRebalance: needsRebal };
 };
+
+// Rewrite EVERY itinerary key to a fresh, short, evenly-spaced one, preserving visible order.
+// Server-authoritative: stamps the server site and bumps the version, so the realtime layer
+// broadcasts it as FULL state (clients adopt it wholesale) rather than as per-item moves —
+// which means a concurrent client edit can't be clobbered, it just re-bases on the new state.
+// Returns the updated trip (with its already-sorted, re-keyed itinerary), or null.
+export const rebalanceItinerary = (code) =>
+  persist(code, (t) => {
+    if (!t.itinerary.length) return false;
+    t.itinerary = rebalanceOrders(t.itinerary, SERVER_SITE);
+    return true;
+  });
 
 // --- Memories (per-user private map pins). Every operation is scoped to a userId, so one
 // user can never read or change another user's memories. Mongo when available, else an

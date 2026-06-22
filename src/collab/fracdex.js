@@ -99,3 +99,40 @@ export const sortByOrder = (items) =>
     const iy = y.id ?? '';
     return ix < iy ? -1 : ix > iy ? 1 : 0;
   });
+
+// ── REBALANCING (mirror of server/src/fracdex.js; see there for the full rationale) ───────
+// Keys only grow when people repeatedly squeeze into the same gap; production fractional-index
+// systems periodically rewrite all keys to fresh evenly-spaced short ones. Server-authoritative
+// (broadcast as full state). These are exported for parity; the client only reads rebalanced
+// state, it doesn't trigger rebalancing.
+export const KEY_LENGTH_THRESHOLD = 12;
+
+export const needsRebalance = (items) =>
+  items.some((it) => stripSite(it.order ?? '').length >= KEY_LENGTH_THRESHOLD);
+
+export const evenKeys = (n) => {
+  if (n <= 0) return [];
+  const LO = 1;
+  const SPAN = 24; // 'b'..'y'
+  let width = 1;
+  let capacity = SPAN;
+  while (capacity < n + 1) { width += 1; capacity *= SPAN; }
+  const out = [];
+  for (let i = 1; i <= n; i += 1) {
+    let pos = Math.round((i * capacity) / (n + 1));
+    pos = Math.min(capacity - 1, Math.max(1, pos));
+    let key = '';
+    for (let w = 0; w < width; w += 1) {
+      key = chr(LO + (pos % SPAN)) + key;
+      pos = Math.floor(pos / SPAN);
+    }
+    out.push(key);
+  }
+  return out;
+};
+
+export const rebalanceOrders = (items, siteId = '') => {
+  const sorted = sortByOrder(items);
+  const fresh = evenKeys(sorted.length);
+  return sorted.map((it, idx) => ({ ...it, order: makeOrder(fresh[idx], siteId) }));
+};

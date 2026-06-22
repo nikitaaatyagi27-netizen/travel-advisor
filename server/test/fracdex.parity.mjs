@@ -78,6 +78,20 @@ const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed
   );
 }
 
+// 4. Rebalancing parity: evenKeys + rebalanceOrders must be byte-identical across copies.
+{
+  for (const n of [0, 1, 3, 24, 50, 200]) {
+    eq(() => server.evenKeys(n).join(','), () => client.evenKeys(n).join(','), `evenKeys(${n})`);
+  }
+  const items = Array.from({ length: 40 }, (_, i) => ({ id: `i${i}`, order: server.makeOrder(server.keyAfterLast(i ? `frac${i}` : null), 's') }));
+  eq(
+    () => server.rebalanceOrders(items, 'srv').map((x) => `${x.id}:${x.order}`).join('|'),
+    () => client.rebalanceOrders(items, 'srv').map((x) => `${x.id}:${x.order}`).join('|'),
+    'rebalanceOrders',
+  );
+  eq(() => String(server.needsRebalance(items)), () => String(client.needsRebalance(items)), 'needsRebalance');
+}
+
 if (samples.length) console.log(samples.join('\n'));
 console.log(`\nfracdex parity: ${checks - failures}/${checks} checks identical, ${failures} differ`);
 process.exit(failures ? 1 : 0);

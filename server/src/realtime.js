@@ -1,6 +1,6 @@
 import {
   addPin, removePin, getTrip,
-  addItineraryItem, removeItineraryItem, moveItineraryItem,
+  addItineraryItem, removeItineraryItem, moveItineraryItem, rebalanceItinerary,
 } from './store.js';
 import { sortByOrder } from './fracdex.js';
 
@@ -155,9 +155,24 @@ export const registerRealtime = (io) => {
         socket.emit('itinerary:action-failed', { itemId, action: 'move', error: err.message });
         return;
       }
-      const { trip, item: moved, orphaned } = result;
+      const { trip, item: moved, orphaned, needsRebalance: needsRebal } = result;
       if (trip && moved) {
         io.to(joinedCode).emit('itinerary:item-moved', { ...moved, version: trip.version });
+        // A key grew past the length threshold — compact ALL keys and broadcast full state so
+        // every client adopts the rebalanced order. Done after the move broadcast so clients
+        // briefly see the move, then settle on the rebalanced (visually identical) order.
+        if (needsRebal) {
+          const rebalanced = await rebalanceItinerary(joinedCode);
+          if (rebalanced) {
+            io.to(joinedCode).emit('trip:state', {
+              code: rebalanced.code,
+              pins: rebalanced.pins,
+              itinerary: sortByOrder(rebalanced.itinerary),
+              version: rebalanced.version || 0,
+              you: null, // full-state rebroadcast; presence/you unchanged
+            });
+          }
+        }
       } else if (orphaned) {
         // The item was removed by someone else before this move landed (move/remove race).
         // Tell just the mover so their optimistic copy disappears instead of lingering. We

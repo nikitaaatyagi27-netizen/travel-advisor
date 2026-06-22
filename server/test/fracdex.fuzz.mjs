@@ -11,7 +11,10 @@
 //
 // Run: node server/test/fracdex.fuzz.mjs   (exit 0 = all invariants held)
 
-import { keyBetween, keyAfterLast, sortByOrder, makeOrder, compareOrder } from '../src/fracdex.js';
+import {
+  keyBetween, keyAfterLast, sortByOrder, makeOrder, compareOrder,
+  evenKeys, rebalanceOrders, needsRebalance, stripSite, KEY_LENGTH_THRESHOLD,
+} from '../src/fracdex.js';
 
 let checks = 0;
 let failures = 0;
@@ -212,6 +215,51 @@ const assertSortedUnique = (orders, label) => {
       assert(compareOrder(arr[i], arr[j]) !== 0, `(10) distinct compound keys tied: ${arr[i]} / ${arr[j]}`);
     }
   }
+}
+
+// ── 11. evenKeys: for many sizes, produces n strictly-increasing, short, valid-terminal keys.
+{
+  for (const n of [1, 2, 3, 10, 23, 24, 50, 100, 576, 1000]) {
+    const keys = evenKeys(n);
+    assert(keys.length === n, `(11) evenKeys(${n}) returned ${keys.length}`);
+    for (let i = 0; i < keys.length; i += 1) {
+      assert(!endsBad(keys[i]), `(11) evenKeys(${n})[${i}]=${keys[i]} ends in a/z`);
+      if (i > 0) assert(keys[i - 1] < keys[i], `(11) evenKeys(${n}) not increasing at ${i}: ${keys[i - 1]}/${keys[i]}`);
+    }
+  }
+}
+
+// ── 12. REBALANCE preserves order + compacts keys. Build a list whose keys have grown long by
+//        repeatedly inserting into the SAME gap (the pathological pattern), confirm it trips
+//        needsRebalance, then rebalance and confirm: same visible order, all keys short again. ─
+{
+  // Force long keys: repeatedly insert just after the first item.
+  let list = [{ id: 'A', order: makeOrder(keyBetween(null, null), 'x') }];
+  list.push({ id: 'B', order: makeOrder(keyAfterLast('m'), 'x') });
+  for (let n = 0; n < 60; n += 1) {
+    const sorted = sortByOrder(list);
+    const lo = sorted[0].order;
+    const hi = sorted[1].order;
+    const k = keyBetween(lo, hi); // always squeeze into the SAME first gap → keys grow
+    list.push({ id: `n${n}`, order: makeOrder(k, 'x') });
+  }
+  const grew = list.some((it) => stripSite(it.order).length >= KEY_LENGTH_THRESHOLD);
+  assert(grew, '(12) expected keys to grow past threshold under same-gap inserts');
+  assert(needsRebalance(list), '(12) needsRebalance should be true for the grown list');
+
+  const orderBefore = sortByOrder(list).map((i) => i.id).join(',');
+  const rebalanced = rebalanceOrders(list, 'srv');
+  const orderAfter = sortByOrder(rebalanced).map((i) => i.id).join(',');
+  assert(orderBefore === orderAfter, `(12) rebalance changed visible order:\n  ${orderBefore}\n  ${orderAfter}`);
+  assert(!needsRebalance(rebalanced), '(12) rebalanced list should no longer need rebalancing');
+  const maxLen = Math.max(...rebalanced.map((i) => stripSite(i.order).length));
+  assert(maxLen < KEY_LENGTH_THRESHOLD, `(12) rebalanced keys still long: max ${maxLen}`);
+  // And the rebalanced keys are still a strict total order with unique values.
+  const orders = sortByOrder(rebalanced).map((i) => i.order);
+  for (let i = 1; i < orders.length; i += 1) {
+    assert(compareOrder(orders[i - 1], orders[i]) < 0, `(12) rebalanced not strictly increasing at ${i}`);
+  }
+  console.log(`rebalance: ${list.length} items, max key len ${Math.max(...list.map((i) => stripSite(i.order).length))} → ${maxLen} after rebalance`);
 }
 
 if (samples.length) console.log(samples.join('\n'));

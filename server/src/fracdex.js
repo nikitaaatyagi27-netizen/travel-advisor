@@ -168,3 +168,52 @@ export const sortByOrder = (items) =>
     const iy = y.id ?? '';
     return ix < iy ? -1 : ix > iy ? 1 : 0;
   });
+
+// ── REBALANCING ──────────────────────────────────────────────────────────────────────────
+// Fractional keys only GROW when people repeatedly insert/move between the SAME two neighbours
+// (each squeeze adds a character). At realistic scale this never bites — the fuzz test shows
+// keys stay ~9 chars even after 40k inserts — but a pathological pattern (always drop a stop
+// into the same gap, thousands of times) would let keys creep longer. Production fractional-
+// index systems (Figma, Jira's LexoRank) periodically REBALANCE: rewrite every key to a fresh,
+// evenly-spaced, short one, preserving the visible order. We do the same when a key crosses a
+// length threshold. This is server-authoritative and broadcast as full state (NOT per-item
+// moves), so it can't clobber a concurrent edit — clients just adopt the rebalanced order.
+export const KEY_LENGTH_THRESHOLD = 12; // rebalance once any fractional key reaches this length
+
+// True if any item's fractional key has grown past the threshold (time to rebalance).
+export const needsRebalance = (items) =>
+  items.some((it) => stripSite(it.order ?? '').length >= KEY_LENGTH_THRESHOLD);
+
+// Generate `n` strictly-increasing, evenly-spaced fractional keys, none ending in 'a'/'z'.
+// Picks the smallest digit width whose capacity (24^width, using digits 'b'..'y') exceeds n,
+// then spreads n positions evenly across that space. Used to re-key a whole list compactly.
+export const evenKeys = (n) => {
+  if (n <= 0) return [];
+  const LO = 1; // 'b'  (0='a' is a boundary marker, never a terminal)
+  const SPAN = 24; // usable digits 'b'..'y'
+  let width = 1;
+  let capacity = SPAN;
+  while (capacity < n + 1) { width += 1; capacity *= SPAN; }
+  const out = [];
+  for (let i = 1; i <= n; i += 1) {
+    let pos = Math.round((i * capacity) / (n + 1)); // even spacing, avoids the 0/capacity edges
+    pos = Math.min(capacity - 1, Math.max(1, pos));
+    let key = '';
+    for (let w = 0; w < width; w += 1) {
+      key = chr(LO + (pos % SPAN)) + key; // shift each base-24 digit into 'b'..'y'
+      pos = Math.floor(pos / SPAN);
+    }
+    out.push(key);
+  }
+  return out;
+};
+
+// Rebalance: return items re-keyed with fresh evenly-spaced compound keys, in their CURRENT
+// sorted order, so the visible order is unchanged but keys are short again. `siteId` stamps the
+// new keys (use the server's site — rebalancing is server-authoritative). Pure: returns a new
+// array of { ...item, order }, leaving the caller to persist + broadcast as full state.
+export const rebalanceOrders = (items, siteId = '') => {
+  const sorted = sortByOrder(items);
+  const fresh = evenKeys(sorted.length);
+  return sorted.map((it, idx) => ({ ...it, order: makeOrder(fresh[idx], siteId) }));
+};

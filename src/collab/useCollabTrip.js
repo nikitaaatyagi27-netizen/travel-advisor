@@ -162,6 +162,11 @@ export const useCollabTrip = (code, name) => {
       setItinerary(sortByOrder(state.itinerary || []));
       if (state.you) setYou(state.you);
       versionRef.current = typeof state.version === 'number' ? state.version : 0;
+      // Full authoritative state supersedes any in-flight optimistic itinerary actions — clear
+      // their fail timers so they don't later flip a now-correct item to "failed". (This also
+      // fires on a server-side rebalance, which arrives as a fresh trip:state.)
+      pendingRef.current.forEach((t) => clearTimeout(t));
+      pendingRef.current.clear();
     });
     socket.on('trip:error', ({ message }) => setError(message));
 
