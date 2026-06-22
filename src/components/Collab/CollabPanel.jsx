@@ -9,6 +9,8 @@ import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import RouteIcon from '@mui/icons-material/Route';
 import TrafficIcon from '@mui/icons-material/Traffic';
+import ReplayIcon from '@mui/icons-material/Replay';
+import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 
 const colorFor = (members, name) =>
   members.find((m) => m.name === name)?.color || '#777';
@@ -17,7 +19,7 @@ const colorFor = (members, name) =>
 const CollabPanel = ({
   pins, itinerary, members,
   onFlyTo, onRemovePin, onAddToItinerary, onRemoveFromItinerary, onMoveItineraryItem,
-  onOptimizeRoute, routeFocus, onExitRouteFocus,
+  onRetryItem, onOptimizeRoute, routeFocus, onExitRouteFocus,
 }) => {
   // Last route summary returned by the optimizer (total distance + method), shown inline.
   const [route, setRoute] = useState(null);
@@ -90,7 +92,11 @@ const CollabPanel = ({
           {pins.map((pin) => (
             <ListItem
               key={pin.id}
-              sx={{ borderRadius: 1, '&:hover': { bgcolor: 'action.hover' } }}
+              sx={{
+                borderRadius: 1, '&:hover': { bgcolor: 'action.hover' },
+                opacity: pin._pending ? 0.55 : 1, // optimistic pin, awaiting server confirmation
+                transition: 'opacity 0.25s',
+              }}
               secondaryAction={
                 <Box>
                   <Tooltip title={inItinerary(pin.id) ? 'Already in itinerary' : 'Add to itinerary'}>
@@ -171,40 +177,56 @@ const CollabPanel = ({
               key={item.id}
               sx={{
                 borderRadius: 1,
-                bgcolor: isActive ? 'action.hover' : 'transparent',
-                '&:hover': { bgcolor: 'action.hover' },
-                // Optimistic edit not yet confirmed by the server — dim it slightly.
+                bgcolor: item.failed ? 'rgba(229,57,53,0.10)' : (isActive ? 'action.hover' : 'transparent'),
+                '&:hover': { bgcolor: item.failed ? 'rgba(229,57,53,0.16)' : 'action.hover' },
+                // Optimistic edit not yet confirmed by the server — dim it slightly. A failed
+                // edit is shown at full opacity (it needs attention), tinted red instead.
                 opacity: item.unconfirmed ? 0.55 : 1,
-                transition: 'opacity 0.25s',
+                transition: 'opacity 0.25s, background-color 0.25s',
               }}
               secondaryAction={
                 <Box sx={{ display: 'flex' }}>
-                  <IconButton size="small" onClick={() => move(item, index, -1)} disabled={index === 0}>
-                    <ArrowUpwardIcon fontSize="small" />
-                  </IconButton>
-                  <IconButton size="small" onClick={() => move(item, index, 1)} disabled={index === itinerary.length - 1}>
-                    <ArrowDownwardIcon fontSize="small" />
-                  </IconButton>
+                  {item.failed ? (
+                    <Tooltip title="Couldn't save — retry">
+                      <IconButton size="small" color="error" onClick={() => onRetryItem?.(item.id)}>
+                        <ReplayIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  ) : (
+                    <>
+                      <IconButton size="small" onClick={() => move(item, index, -1)} disabled={index === 0}>
+                        <ArrowUpwardIcon fontSize="small" />
+                      </IconButton>
+                      <IconButton size="small" onClick={() => move(item, index, 1)} disabled={index === itinerary.length - 1}>
+                        <ArrowDownwardIcon fontSize="small" />
+                      </IconButton>
+                    </>
+                  )}
                   <IconButton size="small" onClick={() => onRemoveFromItinerary(item.id)}>
                     <DeleteOutlineIcon fontSize="small" />
                   </IconButton>
                 </Box>
               }
             >
-              {/* Numbered circle — amber for the active stop, olive otherwise. */}
+              {/* Numbered circle — red on failure, amber for the active stop, olive otherwise. */}
               <Avatar sx={{
                 width: 26, height: 26, fontSize: 13, mr: 1.5, fontWeight: 700,
-                bgcolor: isActive ? 'warning.main' : 'primary.main',
-                color: isActive ? 'warning.contrastText' : 'primary.contrastText',
+                bgcolor: item.failed ? 'error.main' : (isActive ? 'warning.main' : 'primary.main'),
+                color: item.failed ? '#fff' : (isActive ? 'warning.contrastText' : 'primary.contrastText'),
               }}>
-                {index + 1}
+                {item.failed ? <ErrorOutlineIcon sx={{ fontSize: 16 }} /> : index + 1}
               </Avatar>
               <ListItemText
                 primary={item.placeName}
-                secondary={item.unconfirmed ? 'syncing…' : (isActive ? 'active stop' : null)}
+                secondary={
+                  item.failed
+                    ? "Couldn't save — tap retry"
+                    : (item.unconfirmed ? 'syncing…' : (isActive ? 'active stop' : null))
+                }
                 onClick={() => { setActiveItineraryId(item.id); onFlyTo(item); }}
                 sx={{ cursor: 'pointer' }}
                 primaryTypographyProps={{ noWrap: true, fontWeight: 600 }}
+                secondaryTypographyProps={item.failed ? { color: 'error.main', fontWeight: 600 } : undefined}
               />
             </ListItem>
             );

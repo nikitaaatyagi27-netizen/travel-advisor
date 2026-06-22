@@ -414,6 +414,7 @@ const App = () => {
               onAddToItinerary={addToItinerary}
               onRemoveFromItinerary={collab.removeItineraryItem}
               onMoveItineraryItem={collab.moveItineraryItem}
+              onRetryItem={collab.retryItem}
               onOptimizeRoute={optimizeAndFocus}
               routeFocus={routeFocus}
               onExitRouteFocus={exitRouteFocus}

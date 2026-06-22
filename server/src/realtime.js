@@ -79,15 +79,23 @@ export const registerRealtime = (io) => {
     // --- Pins: add ---
     socket.on('pin:add', async ({ pin }) => {
       if (!joinedCode) return;
-      const trip = await addPin(joinedCode, { ...pin, addedBy: me?.name });
-      if (trip) io.to(joinedCode).emit('pin:added', trip.pins[trip.pins.length - 1]);
+      try {
+        const trip = await addPin(joinedCode, { ...pin, addedBy: me?.name });
+        if (trip) io.to(joinedCode).emit('pin:added', trip.pins[trip.pins.length - 1]);
+      } catch (err) {
+        socket.emit('trip:error', { message: `Couldn't save pin: ${err.message}` });
+      }
     });
 
     // --- Pins: remove ---
     socket.on('pin:remove', async ({ pinId }) => {
       if (!joinedCode) return;
-      const trip = await removePin(joinedCode, pinId);
-      if (trip) io.to(joinedCode).emit('pin:removed', { pinId });
+      try {
+        const trip = await removePin(joinedCode, pinId);
+        if (trip) io.to(joinedCode).emit('pin:removed', { pinId });
+      } catch (err) {
+        socket.emit('trip:error', { message: `Couldn't remove pin: ${err.message}` });
+      }
     });
 
     // --- Itinerary: granular, action-based edits (add / remove / move) ---
@@ -98,22 +106,42 @@ export const registerRealtime = (io) => {
     // single source of truth — the sender reconciles its optimistic state with it.
 
     // Every broadcast carries the trip's new `version` so receivers can spot a dropped event.
+    //
+    // Each itinerary handler is wrapped so that if the store throws (e.g. the DB save fails),
+    // we tell JUST the sender via `itinerary:action-failed` with the item's id — instead of
+    // silently doing nothing, which would leave the sender's optimistic copy stuck "syncing…"
+    // forever. The client uses this (and a timeout) to flip the item into a "failed" state.
 
     socket.on('itinerary:add', async ({ item }) => {
       if (!joinedCode) return;
-      const { trip, item: added } = await addItineraryItem(joinedCode, { ...item, addedBy: me?.name });
-      if (trip && added) io.to(joinedCode).emit('itinerary:item-added', { ...added, version: trip.version });
+      try {
+        const { trip, item: added } = await addItineraryItem(joinedCode, { ...item, addedBy: me?.name });
+        if (trip && added) io.to(joinedCode).emit('itinerary:item-added', { ...added, version: trip.version });
+      } catch (err) {
+        socket.emit('itinerary:action-failed', { itemId: item?.id, action: 'add', error: err.message });
+      }
     });
 
     socket.on('itinerary:remove', async ({ itemId }) => {
       if (!joinedCode) return;
-      const trip = await removeItineraryItem(joinedCode, itemId);
-      if (trip) io.to(joinedCode).emit('itinerary:item-removed', { itemId, version: trip.version });
+      try {
+        const trip = await removeItineraryItem(joinedCode, itemId);
+        if (trip) io.to(joinedCode).emit('itinerary:item-removed', { itemId, version: trip.version });
+      } catch (err) {
+        socket.emit('itinerary:action-failed', { itemId, action: 'remove', error: err.message });
+      }
     });
 
     socket.on('itinerary:move', async ({ itemId, order }) => {
       if (!joinedCode) return;
-      const { trip, item: moved, orphaned } = await moveItineraryItem(joinedCode, itemId, order);
+      let result;
+      try {
+        result = await moveItineraryItem(joinedCode, itemId, order);
+      } catch (err) {
+        socket.emit('itinerary:action-failed', { itemId, action: 'move', error: err.message });
+        return;
+      }
+      const { trip, item: moved, orphaned } = result;
       if (trip && moved) {
         io.to(joinedCode).emit('itinerary:item-moved', { ...moved, version: trip.version });
       } else if (orphaned) {

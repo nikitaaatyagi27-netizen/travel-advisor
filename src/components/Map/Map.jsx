@@ -379,6 +379,9 @@ const Map = ({
               position: 'absolute',
               transform: 'translate(-50%, -100%)',
               zIndex: 4,
+              // Optimistic pin not yet confirmed by the server — show it semi-transparent.
+              opacity: pin._pending ? 0.5 : 1,
+              transition: 'opacity 0.25s',
               // Route-focus: dim pins that aren't part of the route (itinerary pins stay sharp).
               ...(routeFocus && !itineraryIds.has(pin.id) ? dimmedSx : focusTransition),
             }}

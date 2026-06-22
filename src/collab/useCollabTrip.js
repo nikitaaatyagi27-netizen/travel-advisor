@@ -39,6 +39,57 @@ export const useCollabTrip = (code, name) => {
   // brief drop (e.g. phone in a tunnel) doesn't silently lose the user's edits.
   const outboxRef = useRef([]);
 
+  // In-flight optimistic itinerary actions: itemId -> timeout handle. When we emit an add/move
+  // we start a timer; if the server's confirming broadcast doesn't arrive in time (it crashed,
+  // the network ate the response), the timer flips the item to `failed` so the user sees an
+  // error + retry instead of an item stuck forever on "syncing…". A confirming broadcast (or
+  // an explicit action-failed) clears the timer.
+  const pendingRef = useRef(new Map());
+  const ACTION_TIMEOUT_MS = 8000;
+
+  // Stop tracking an in-flight action (its outcome arrived).
+  const clearPending = useCallback((itemId) => {
+    const t = pendingRef.current.get(itemId);
+    if (t) { clearTimeout(t); pendingRef.current.delete(itemId); }
+  }, []);
+
+  // Mark an optimistic item as failed: clear its pending timer and flag it for the UI.
+  const failItem = useCallback((itemId) => {
+    clearPending(itemId);
+    setItinerary((prev) =>
+      prev.map((i) => (i.id === itemId ? { ...i, unconfirmed: false, failed: true } : i)),
+    );
+  }, [clearPending]);
+
+  // Start the confirm-or-fail timer for an optimistic action on `itemId`.
+  const markPending = useCallback((itemId) => {
+    clearPending(itemId); // restart the clock if it was already pending (e.g. a retry)
+    const t = setTimeout(() => failItem(itemId), ACTION_TIMEOUT_MS);
+    pendingRef.current.set(itemId, t);
+  }, [clearPending, failItem]);
+
+  // --- Optimistic PINS: same broadcast-back + timeout model as the itinerary. A pin shows on
+  // the local map instantly; the server's broadcast confirms it. If no confirmation arrives in
+  // time (server crashed / response lost) we ROLL BACK: an unconfirmed add is removed, an
+  // unconfirmed remove is restored. pinPendingRef: pinId -> { timeout, rollback }. ---
+  const pinPendingRef = useRef(new Map());
+
+  const clearPinPending = useCallback((pinId) => {
+    const entry = pinPendingRef.current.get(pinId);
+    if (entry) { clearTimeout(entry.timeout); pinPendingRef.current.delete(pinId); }
+  }, []);
+
+  // Track an optimistic pin op; `rollback` undoes the optimistic change if it times out.
+  const markPinPending = useCallback((pinId, rollback) => {
+    clearPinPending(pinId);
+    const timeout = setTimeout(() => {
+      pinPendingRef.current.delete(pinId);
+      rollback();
+      setError('Could not reach the server — that pin change was undone.');
+    }, ACTION_TIMEOUT_MS);
+    pinPendingRef.current.set(pinId, { timeout, rollback });
+  }, [clearPinPending]);
+
   // Emit now if connected, else queue for replay on reconnect. The server is the source of
   // truth, so re-applying a queued action after a resync is safe (adds dedupe by id; a move
   // just re-sets one key; a remove of an already-gone item is a no-op).
@@ -51,7 +102,24 @@ export const useCollabTrip = (code, name) => {
   useEffect(() => {
     if (!code || !name) return undefined;
 
-    const socket = io(SERVER_URL, { transports: ['websocket', 'polling'] });
+    // Snapshot the pending-timer maps so the cleanup closure references a stable value (these
+    // refs are created once and never reassigned, but this keeps react-hooks/exhaustive-deps
+    // happy and is correct regardless).
+    const pending = pendingRef.current;
+    const pinPending = pinPendingRef.current;
+
+    const socket = io(SERVER_URL, {
+      transports: ['websocket', 'polling'],
+      // Reconnection is on by default; we set these explicitly to document intent. We retry
+      // forever (Infinity) rather than giving up — a long tunnel/flaky link should recover on
+      // its own without the user refreshing. On each successful reconnect the 'connect'
+      // handler re-joins the room and pulls fresh state, so no missed updates linger.
+      reconnection: true,
+      reconnectionDelay: 1000, // first retry after 1s
+      reconnectionDelayMax: 5000, // backoff caps at 5s between retries
+      reconnectionAttempts: Infinity,
+      timeout: 20000,
+    });
     socketRef.current = socket;
 
     // On (re)connect, (re)join and flush any actions queued while we were offline. trip:join
@@ -64,7 +132,14 @@ export const useCollabTrip = (code, name) => {
       outboxRef.current = [];
       queued.forEach(({ event, payload }) => socket.emit(event, payload));
     });
-    socket.on('disconnect', () => setConnected(false));
+    socket.on('disconnect', (reason) => {
+      setConnected(false);
+      // When the SERVER ends the connection (a restart/redeploy, or an explicit
+      // socket.disconnect()), Socket.IO does NOT auto-reconnect — it assumes the kick was
+      // intentional. For a live trip we DO want back in, so reconnect manually. Every other
+      // reason (transport drop, ping timeout, network loss) is handled by auto-reconnect.
+      if (reason === 'io server disconnect') socket.connect();
+    });
 
     // Apply a version stamp from a broadcast. Returns false if this event is STALE (older than
     // what we've applied — ignore it) and triggers a resync if we detect a GAP (missed event).
@@ -91,12 +166,22 @@ export const useCollabTrip = (code, name) => {
     socket.on('trip:error', ({ message }) => setError(message));
 
     // Pins.
-    socket.on('pin:added', (pin) =>
-      setPins((prev) => (prev.some((p) => p.id === pin.id) ? prev : [...prev, pin]))
-    );
-    socket.on('pin:removed', ({ pinId }) =>
-      setPins((prev) => prev.filter((p) => p.id !== pinId))
-    );
+    // Pins are optimistic: the local user sees their own pin instantly (added by addPin
+    // below, flagged `_pending`), and this broadcast CONFIRMS it (clears `_pending`) — or adds
+    // it fresh for everyone else in the room. Dedupes by id so the optimistic copy + the
+    // broadcast never double-add.
+    socket.on('pin:added', (pin) => {
+      clearPinPending(pin.id); // server confirmed — stop the rollback timer
+      setPins((prev) =>
+        prev.some((p) => p.id === pin.id)
+          ? prev.map((p) => (p.id === pin.id ? { ...pin, _pending: false } : p)) // confirm
+          : [...prev, pin]
+      );
+    });
+    socket.on('pin:removed', ({ pinId }) => {
+      clearPinPending(pinId);
+      setPins((prev) => prev.filter((p) => p.id !== pinId));
+    });
 
     // Itinerary — granular actions, kept sorted by each item's fractional-index `order`.
     // The server is the source of truth for `order`, so we reconcile our optimistic state
@@ -104,6 +189,7 @@ export const useCollabTrip = (code, name) => {
     // authoritative and CONFIRMED, so it replaces any optimistic/unconfirmed local copy.
     socket.on('itinerary:item-added', ({ version, ...item }) => {
       if (!applyVersion(version)) return; // stale/duplicate broadcast — ignore
+      clearPending(item.id); // confirmed by the server — stop the fail timer
       setItinerary((prev) =>
         prev.some((i) => i.id === item.id)
           ? sortByOrder(prev.map((i) => (i.id === item.id ? item : i))) // confirm provisional
@@ -112,13 +198,20 @@ export const useCollabTrip = (code, name) => {
     });
     socket.on('itinerary:item-removed', ({ itemId, version }) => {
       if (!applyVersion(version)) return;
+      clearPending(itemId);
       setItinerary((prev) => prev.filter((i) => i.id !== itemId));
     });
     socket.on('itinerary:item-moved', ({ id, order, version }) => {
       if (!applyVersion(version)) return;
+      clearPending(id);
       setItinerary((prev) =>
-        sortByOrder(prev.map((i) => (i.id === id ? { ...i, order, unconfirmed: false } : i)))
+        sortByOrder(prev.map((i) => (i.id === id ? { ...i, order, unconfirmed: false, failed: false } : i)))
       );
+    });
+    // The server couldn't save this action (e.g. DB write failed). Flag the item so the UI
+    // shows an error + a retry affordance instead of leaving it stuck on "syncing…".
+    socket.on('itinerary:action-failed', ({ itemId }) => {
+      if (itemId) failItem(itemId);
     });
 
     // Presence.
@@ -135,18 +228,31 @@ export const useCollabTrip = (code, name) => {
     return () => {
       socket.disconnect();
       socketRef.current = null;
+      pending.forEach((t) => clearTimeout(t)); // don't leak fail timers on unmount
+      pending.clear();
+      pinPending.forEach((e) => clearTimeout(e.timeout));
+      pinPending.clear();
     };
-  }, [code, name]);
+  }, [code, name, clearPending, failItem, clearPinPending]);
 
   // --- Actions ---
 
+  // Optimistic add: the pin shows on the local map immediately (flagged `_pending`), then the
+  // server's `pin:added` broadcast confirms it. If confirmation never comes, it rolls back.
   const addPin = useCallback((pin) => {
+    setPins((prev) => (prev.some((p) => p.id === pin.id) ? prev : [...prev, { ...pin, _pending: true }]));
     sendOrQueue('pin:add', { pin });
-  }, [sendOrQueue]);
+    markPinPending(pin.id, () => setPins((prev) => prev.filter((p) => p.id !== pin.id))); // rollback = un-add
+  }, [sendOrQueue, markPinPending]);
 
+  // Optimistic remove: the pin disappears locally at once; `pin:removed` confirms it. If that
+  // never arrives, we restore the pin (rollback) so the user isn't misled into thinking it's gone.
   const removePin = useCallback((pinId) => {
+    let removed = null;
+    setPins((prev) => { removed = prev.find((p) => p.id === pinId) || null; return prev.filter((p) => p.id !== pinId); });
     sendOrQueue('pin:remove', { pinId });
-  }, [sendOrQueue]);
+    markPinPending(pinId, () => { if (removed) setPins((prev) => (prev.some((p) => p.id === pinId) ? prev : [...prev, removed])); });
+  }, [sendOrQueue, markPinPending]);
 
   // Keep a live ref to the current itinerary so move/add can read neighbors without
   // being re-created on every list change (and without stale-closure bugs).
@@ -164,7 +270,8 @@ export const useCollabTrip = (code, name) => {
     const provisional = { ...item, order: makeOrder(frac, mySiteId), unconfirmed: true };
     setItinerary((prev) => sortByOrder([...prev, provisional]));
     sendOrQueue('itinerary:add', { item });
-  }, [sendOrQueue]);
+    markPending(item.id);
+  }, [sendOrQueue, markPending]);
 
   const removeItineraryItem = useCallback((itemId) => {
     setItinerary((prev) => prev.filter((i) => i.id !== itemId));
@@ -189,10 +296,11 @@ export const useCollabTrip = (code, name) => {
     }
     const order = makeOrder(frac, mySiteId);
     setItinerary((prev) =>
-      sortByOrder(prev.map((i) => (i.id === itemId ? { ...i, order, unconfirmed: true } : i)))
+      sortByOrder(prev.map((i) => (i.id === itemId ? { ...i, order, unconfirmed: true, failed: false } : i)))
     );
     sendOrQueue('itinerary:move', { itemId, order });
-  }, [sendOrQueue]);
+    markPending(itemId);
+  }, [sendOrQueue, markPending]);
 
   // Optimize the itinerary's visiting order and apply it. We reassign fresh, strictly-
   // increasing fractional-index keys in the optimized sequence and emit a `move` per stop —
@@ -240,11 +348,28 @@ export const useCollabTrip = (code, name) => {
       return sortByOrder(prev.map((i) => (byId.has(i.id) ? { ...i, order: byId.get(i.id), unconfirmed: true } : i)));
     });
     updates.forEach(({ id, order }) => {
-      if (oldKey.get(id) !== order) sendOrQueue('itinerary:move', { itemId: id, order });
+      if (oldKey.get(id) !== order) { sendOrQueue('itinerary:move', { itemId: id, order }); markPending(id); }
     });
 
     return summary;
-  }, [sendOrQueue]);
+  }, [sendOrQueue, markPending]);
+
+  // Re-send a failed itinerary action. A failed item still sits in local state carrying its
+  // intended `order`; we just re-emit it, clear the failed flag, and restart the fail timer.
+  // (Both add and move funnel through itinerary:move on the server — re-asserting the item's
+  // order via a move re-adds it if it never landed, and re-positions it if it did.)
+  const retryItem = useCallback((itemId) => {
+    const item = itineraryRef.current.find((i) => i.id === itemId);
+    if (!item) return;
+    setItinerary((prev) =>
+      prev.map((i) => (i.id === itemId ? { ...i, failed: false, unconfirmed: true } : i)),
+    );
+    // Re-add (so it lands even if the original add never persisted), then the server's
+    // broadcast carries the canonical order and clears the pending state.
+    sendOrQueue('itinerary:add', { item: { id: item.id, placeName: item.placeName, lat: item.lat, lng: item.lng } });
+    sendOrQueue('itinerary:move', { itemId: item.id, order: item.order });
+    markPending(itemId);
+  }, [sendOrQueue, markPending]);
 
   // Share our own map viewport so anyone following us can mirror it.
   const broadcastViewport = useCallback((center, zoom) => {
@@ -275,6 +400,7 @@ export const useCollabTrip = (code, name) => {
     addItineraryItem,
     removeItineraryItem,
     moveItineraryItem,
+    retryItem,
     optimizeItinerary,
     broadcastViewport,
     follow,
