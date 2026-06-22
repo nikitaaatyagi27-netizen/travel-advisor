@@ -94,8 +94,13 @@ export const registerRealtime = (io) => {
     socket.on('pin:add', async ({ pin }) => {
       if (!joinedCode) return;
       try {
-        const trip = await addPin(joinedCode, { ...pin, addedBy: me?.name });
-        if (trip) io.to(joinedCode).emit('pin:added', trip.pins[trip.pins.length - 1]);
+        const { trip, rejected } = await addPin(joinedCode, { ...pin, addedBy: me?.name });
+        if (rejected) {
+          // Hit the per-trip pin cap — tell just the sender; their optimistic pin rolls back.
+          socket.emit('pin:rejected', { pinId: pin.id, reason: 'This trip has reached its pin limit.' });
+        } else if (trip) {
+          io.to(joinedCode).emit('pin:added', trip.pins[trip.pins.length - 1]);
+        }
       } catch (err) {
         socket.emit('trip:error', { message: `Couldn't save pin: ${err.message}` });
       }

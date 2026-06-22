@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { customAlphabet } from 'nanoid';
-import { Trip } from './models/Trip.js';
+import { Trip, ttlFromNow, DEFAULT_MAX_PINS } from './models/Trip.js';
 import { Memory } from './models/Memory.js';
 import {
   keyAfterLast, sortByOrder, makeOrder, stripSite, needsRebalance, rebalanceOrders,
@@ -59,7 +59,12 @@ export const connectStore = async (mongoUri) => {
   }
 };
 
-const blankTrip = (code) => ({ code, pins: [], itinerary: [], version: 0, createdAt: new Date() });
+const blankTrip = (code) => ({
+  code, pins: [], itinerary: [], version: 0,
+  lastActiveAt: new Date(), expiresAt: ttlFromNow(),
+  settings: { maxPins: DEFAULT_MAX_PINS },
+  createdAt: new Date(),
+});
 
 export const createTrip = async () => {
   const code = makeCode();
@@ -109,27 +114,46 @@ export const getTrip = async (code) => {
 // `false` to signal "no real change" — then we DON'T bump the version (e.g. a duplicate add
 // or a move targeting an already-removed item), so a no-op never advances the sequence.
 
+// On a real change we also "touch" the trip: bump lastActiveAt and push expiresAt forward, so
+// an actively-edited trip never hits its TTL and only abandoned trips get auto-reaped.
+const touch = (trip) => { trip.lastActiveAt = new Date(); trip.expiresAt = ttlFromNow(); };
+
 const persist = async (code, mutate) => {
   if (useMongo) {
     const trip = await Trip.findOne({ code });
     if (!trip) return null;
     const changed = mutate(trip) !== false;
-    if (changed) trip.version = (trip.version || 0) + 1;
+    if (changed) { trip.version = (trip.version || 0) + 1; touch(trip); }
     await trip.save();
     return trip.toObject();
   }
   const trip = memory.get(code);
   if (!trip) return null;
   const changed = mutate(trip) !== false;
-  if (changed) trip.version = (trip.version || 0) + 1;
+  if (changed) { trip.version = (trip.version || 0) + 1; touch(trip); }
   return trip;
 };
 
-export const addPin = (code, pin) =>
-  persist(code, (t) => { t.pins.push(pin); });
+// Add a pin, unless the trip is already at its maxPins cap (abuse guard). On rejection we
+// return { trip: <unchanged>, rejected: true } so the realtime layer can tell the sender;
+// otherwise { trip } with the new pin appended.
+export const addPin = async (code, pin) => {
+  let rejected = false;
+  const trip = await persist(code, (t) => {
+    const cap = t.settings?.maxPins ?? DEFAULT_MAX_PINS;
+    if (t.pins.length >= cap) { rejected = true; return false; } // at cap → no-op, no version bump
+    t.pins.push(pin);
+    return true;
+  });
+  return { trip, rejected };
+};
 
 export const removePin = (code, pinId) =>
-  persist(code, (t) => { t.pins = t.pins.filter((p) => p.id !== pinId); });
+  persist(code, (t) => {
+    const before = t.pins.length;
+    t.pins = t.pins.filter((p) => p.id !== pinId);
+    return t.pins.length !== before; // no-op (no version bump) if nothing was removed
+  });
 
 // --- Itinerary: granular, action-based edits ---
 //

@@ -187,6 +187,13 @@ export const useCollabTrip = (code, name) => {
       clearPinPending(pinId);
       setPins((prev) => prev.filter((p) => p.id !== pinId));
     });
+    // Server refused the pin (e.g. the trip hit its pin cap). Roll back the optimistic pin
+    // and surface why, instead of leaving it dangling until its timeout.
+    socket.on('pin:rejected', ({ pinId, reason }) => {
+      clearPinPending(pinId);
+      setPins((prev) => prev.filter((p) => p.id !== pinId));
+      setError(reason || 'That pin could not be added.');
+    });
 
     // Itinerary — granular actions, kept sorted by each item's fractional-index `order`.
     // The server is the source of truth for `order`, so we reconcile our optimistic state
